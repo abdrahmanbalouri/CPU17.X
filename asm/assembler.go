@@ -4,44 +4,12 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 	"unicode"
 )
-
-type TokenType int
-
-const (
-	TOKEN_LABEL TokenType = iota
-	TOKEN_INSTRUCTION
-	TOKEN_REGISTER
-	TOKEN_DIRECT
-	TOKEN_INDIRECT
-	TOKEN_COMMA
-	TOKEN_NEWLINE
-	TOKEN_DOT_NAME
-	TOKEN_DOT_DESC
-	TOKEN_EOF
-)
-
-type Token struct {
-	Type  TokenType
-	Value string
-	Line  int
-}
-
-type ParsedInstruction struct {
-	Label    string
-	Name     string
-	Params   []string
-	Line     int
-}
-
-type Label struct {
-	Name string
-	Pos  int
-}
 
 type ParseError struct {
 	Line int
@@ -52,10 +20,29 @@ func (e *ParseError) Error() string {
 	return fmt.Sprintf("line %d: %s", e.Line, e.Msg)
 }
 
+type codeLine struct {
+	Line int
+	Text string
+}
+
+type argument struct {
+	Raw   string
+	Type  ParamType
+	Value int32
+	Label string
+}
+
+type ParsedInstruction struct {
+	Name   string
+	Args   []argument
+	Line   int
+	Offset int
+}
+
 func Assemble(inputPath, outputPath string) error {
 	file, err := os.Open(inputPath)
 	if err != nil {
-		return fmt.Errorf("cannot open file: %v", err)
+		return fmt.Errorf("cannot open file: %w", err)
 	}
 	defer file.Close()
 
@@ -64,23 +51,25 @@ func Assemble(inputPath, outputPath string) error {
 		return err
 	}
 
-	// First pass: find .name and .description
 	name, desc, codeLines, err := extractMeta(lines)
 	if err != nil {
 		return err
 	}
 
-	// Second pass: find labels and their positions
-	labels := findLabels(codeLines)
-
-	// Third pass: parse instructions and resolve labels
-	instructions, err := parseInstructions(codeLines, labels)
+	instructions, labels, err := parseProgram(codeLines)
 	if err != nil {
 		return err
 	}
 
-	// Generate binary
-	return generateBinary(outputPath, name, desc, instructions)
+	code, err := encodeProgram(instructions, labels)
+	if err != nil {
+		return err
+	}
+	if len(code) > CHAMP_MAX_SIZE {
+		return fmt.Errorf("program too large: %d bytes (max %d)", len(code), CHAMP_MAX_SIZE)
+	}
+
+	return writeBinary(outputPath, name, desc, code)
 }
 
 func readLines(file *os.File) ([]string, error) {
@@ -90,393 +79,374 @@ func readLines(file *os.File) ([]string, error) {
 		lines = append(lines, scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading file: %v", err)
+		return nil, fmt.Errorf("error reading file: %w", err)
 	}
-	lines = append(lines, "")
 	return lines, nil
 }
 
-func extractMeta(lines []string) (name, desc string, codeLines []string, err error) {
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, ".name") {
-			parts := strings.SplitN(line, "\"", 2)
-			if len(parts) < 2 {
-				return "", "", nil, &ParseError{Line: i + 1, Msg: "invalid .name syntax"}
-			}
-			parts = strings.SplitN(parts[1], "\"", 2)
-			name = parts[0]
+func extractMeta(lines []string) (string, string, []codeLine, error) {
+	var name, desc string
+	var code []codeLine
+
+	for i, raw := range lines {
+		lineNo := i + 1
+		line := strings.TrimSpace(stripComment(raw))
+		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, ".description") {
-			parts := strings.SplitN(line, "\"", 2)
-			if len(parts) < 2 {
-				return "", "", nil, &ParseError{Line: i + 1, Msg: "invalid .description syntax"}
+
+		switch {
+		case strings.HasPrefix(line, ".name"):
+			value, err := quotedDirective(line, ".name", lineNo)
+			if err != nil {
+				return "", "", nil, err
 			}
-			parts = strings.SplitN(parts[1], "\"", 2)
-			desc = parts[0]
-			continue
-		}
-		if line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, ";") {
-			codeLines = append(codeLines, line)
+			if len(value) > PROG_NAME_LENGTH {
+				return "", "", nil, &ParseError{Line: lineNo, Msg: "name is too long"}
+			}
+			name = value
+		case strings.HasPrefix(line, ".description"):
+			value, err := quotedDirective(line, ".description", lineNo)
+			if err != nil {
+				return "", "", nil, err
+			}
+			if len(value) > COMMENT_LENGTH {
+				return "", "", nil, &ParseError{Line: lineNo, Msg: "description is too long"}
+			}
+			desc = value
+		default:
+			code = append(code, codeLine{Line: lineNo, Text: line})
 		}
 	}
+
 	if name == "" {
 		return "", "", nil, &ParseError{Line: 1, Msg: "no .name directive found"}
 	}
-	return name, desc, codeLines, nil
+	if desc == "" {
+		return "", "", nil, &ParseError{Line: 1, Msg: "no .description directive found"}
+	}
+	return name, desc, code, nil
 }
 
-func findLabels(lines []string) map[string]int {
-	labels := make(map[string]int)
-	pos := 0
+func quotedDirective(line, directive string, lineNo int) (string, error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(line, directive))
+	if !strings.HasPrefix(rest, "\"") {
+		return "", &ParseError{Line: lineNo, Msg: "missing opening quote for " + directive}
+	}
+	rest = rest[1:]
+	end := strings.IndexByte(rest, '"')
+	if end < 0 {
+		return "", &ParseError{Line: lineNo, Msg: "missing closing quote for " + directive}
+	}
+	if strings.TrimSpace(rest[end+1:]) != "" {
+		return "", &ParseError{Line: lineNo, Msg: "unexpected text after " + directive}
+	}
+	return rest[:end], nil
+}
 
-	for _, line := range lines {
-		parts := strings.Fields(line)
-		for _, part := range parts {
-			if strings.HasSuffix(part, ":") {
-				label := strings.TrimSuffix(part, ":")
-				labels[label] = pos
-			}
+func stripComment(line string) string {
+	inQuote := false
+	for i, r := range line {
+		if r == '"' {
+			inQuote = !inQuote
 		}
-		if len(parts) > 0 && parts[0] != "" {
-			_, ok := Instructions[parts[0]]
-			if ok {
-				pos += 1 + opcodeSize(parts[0], len(parts)-1)
-			}
+		if !inQuote && (r == '#' || r == ';') {
+			return line[:i]
 		}
 	}
-	return labels
+	return line
 }
 
-func parseInstructions(lines []string, labels map[string]int) ([]ParsedInstruction, error) {
+func parseProgram(lines []codeLine) ([]ParsedInstruction, map[string]int, error) {
 	var instructions []ParsedInstruction
+	labels := make(map[string]int)
+	offset := 0
 
-	for lineNum, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+	for _, src := range lines {
+		rest := strings.TrimSpace(src.Text)
+		for {
+			label, tail, ok, err := takeLabel(rest, src.Line)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !ok {
+				break
+			}
+			if _, exists := labels[label]; exists {
+				return nil, nil, &ParseError{Line: src.Line, Msg: "repeated label: " + label}
+			}
+			labels[label] = offset
+			rest = strings.TrimSpace(tail)
+			if rest == "" {
+				break
+			}
+		}
+		if rest == "" {
 			continue
 		}
 
-		inst, err := parseLine(line, labels, lineNum+1)
+		inst, err := parseInstruction(rest, src.Line, offset)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if inst != nil {
-			instructions = append(instructions, *inst)
-		}
+		instructions = append(instructions, inst)
+		offset += instructionSize(inst)
 	}
-	return instructions, nil
+
+	return instructions, labels, nil
 }
 
-func parseLine(line string, labels map[string]int, lineNum int) (*ParsedInstruction, error) {
-	var inst ParsedInstruction
-	inst.Line = lineNum
-
-	// Handle labels - they can be at start or end of instruction
-	parts := strings.Fields(line)
-	if len(parts) == 0 {
-		return nil, nil
+func takeLabel(line string, lineNo int) (string, string, bool, error) {
+	colon := strings.IndexByte(line, ':')
+	if colon < 0 {
+		return "", line, false, nil
 	}
-
-	// Check if first part is a label (ends with :)
-	if strings.HasSuffix(parts[0], ":") {
-		inst.Label = strings.TrimSuffix(parts[0], ":")
-		parts = parts[1:]
-		if len(parts) == 0 {
-			return nil, nil // just a label declaration, no instruction
-		}
+	firstSpace := strings.IndexFunc(line, unicode.IsSpace)
+	if firstSpace >= 0 && firstSpace < colon {
+		return "", line, false, nil
 	}
-
-	// Now parts[0] should be the instruction
-	inst.Name = parts[0]
-	if _, ok := Instructions[inst.Name]; !ok {
-		return nil, &ParseError{Line: lineNum, Msg: fmt.Sprintf("unknown instruction: %s", inst.Name)}
+	label := strings.TrimSpace(line[:colon])
+	if label == "" {
+		return "", "", false, &ParseError{Line: lineNo, Msg: "empty label"}
 	}
-
-	if len(parts) > 1 {
-		paramStr := strings.Join(parts[1:], "")
-		inst.Params = strings.Split(paramStr, ",")
-		for i, p := range inst.Params {
-			inst.Params[i] = strings.TrimSpace(p)
-		}
+	if !validLabel(label) {
+		return "", "", false, &ParseError{Line: lineNo, Msg: "invalid label: " + label}
 	}
-
-	return &inst, nil
+	return label, line[colon+1:], true, nil
 }
 
-func opcodeSize(name string, paramCount int) int {
-	inst, ok := Instructions[name]
-	if !ok {
-		return 0
-	}
-
-	size := 0
-	if inst.HasPcode {
-		size += 1
-	}
-
-	for i := 0; i < inst.NbParams; i++ {
-		paramType := inst.Params[i]
-		if paramType == PARAM_REG {
-			size += 1
-		} else if inst.HasIdx {
-			size += IND_SIZE
-		} else {
-			size += DIR_SIZE
-		}
-	}
-	return size
-}
-
-func generateBinary(path, name, desc string, instructions []ParsedInstruction) error {
-	// First pass: compute label positions
-	labelPositions := make(map[string]int)
-	pos := 0
-	for _, inst := range instructions {
-		if inst.Label != "" {
-			labelPositions[inst.Label] = pos
-		}
-		bin, _ := encodeInstruction(inst, labelPositions)
-		pos += len(bin)
-	}
-
-	// Second pass: encode with resolved labels
-	code := make([]byte, 0)
-	for _, inst := range instructions {
-		bin, err := encodeInstruction(inst, labelPositions)
-		if err != nil {
-			return err
-		}
-		code = append(code, bin...)
-	}
-
-	if len(code) > CHAMP_MAX_SIZE {
-		return fmt.Errorf("program too large: %d bytes (max %d)", len(code), CHAMP_MAX_SIZE)
-	}
-
-	// Create file
-	f, err := os.Create(path)
-	if err != nil {
-		return fmt.Errorf("cannot create output file: %v", err)
-	}
-	defer f.Close()
-
-	// Write magic (big-endian)
-	binary.Write(f, binary.BigEndian, MAGIC)
-
-	// Write name (null-padded to 128 bytes)
-	nameBytes := []byte(name)
-	if len(nameBytes) > PROG_NAME_LENGTH {
-		nameBytes = nameBytes[:PROG_NAME_LENGTH]
-	}
-	f.Write(nameBytes)
-	if len(nameBytes) < PROG_NAME_LENGTH {
-		f.Write(make([]byte, PROG_NAME_LENGTH-len(nameBytes)))
-	}
-
-	// Write program size (big-endian)
-	binary.Write(f, binary.BigEndian, uint32(len(code)))
-
-	// Write description (null-padded to 2048 bytes)
-	descBytes := []byte(desc)
-	if len(descBytes) > COMMENT_LENGTH {
-		descBytes = descBytes[:COMMENT_LENGTH]
-	}
-	f.Write(descBytes)
-	if len(descBytes) < COMMENT_LENGTH {
-		f.Write(make([]byte, COMMENT_LENGTH-len(descBytes)))
-	}
-
-	// Write code
-	f.Write(code)
-
-	return nil
-}
-
-func encodeInstruction(inst ParsedInstruction, labelPositions map[string]int) ([]byte, error) {
-	instDef, ok := Instructions[inst.Name]
-	if !ok {
-		return nil, fmt.Errorf("unknown instruction: %s", inst.Name)
-	}
-
-	result := make([]byte, 0)
-
-	// Write opcode
-	result = append(result, byte(instDef.OpCode))
-
-	// Write pcode if needed
-	if instDef.HasPcode {
-		pcode := calculatePcode(inst.Name, inst.Params)
-		result = append(result, pcode)
-	}
-
-	// Calculate position after this instruction for label resolution
-	currentPos := len(result)
-
-	// Write parameters
-	for i, param := range inst.Params {
-		if i >= len(instDef.Params) {
-			break
-		}
-
-		paramType := instDef.Params[i]
-		val, err := parseParameter(param, paramType, instDef.HasIdx, inst.Line, labelPositions, currentPos)
-		if err != nil {
-			return nil, err
-		}
-
-		if paramType == PARAM_REG {
-			result = append(result, byte(val))
-			currentPos++
-		} else if instDef.HasIdx {
-			// 2 bytes
-			result = append(result, byte((val>>8)&0xFF), byte(val&0xFF))
-			currentPos += 2
-		} else {
-			// 4 bytes
-			result = append(result,
-				byte((val>>24)&0xFF),
-				byte((val>>16)&0xFF),
-				byte((val>>8)&0xFF),
-				byte(val&0xFF))
-			currentPos += 4
-		}
-	}
-
-	return result, nil
-}
-
-func calculatePcode(instName string, params []string) byte {
-	inst, ok := Instructions[instName]
-	if !ok {
-		return 0
-	}
-
-	var pcode byte
-	shift := 6
-
-	for i := 0; i < len(params) && i < len(inst.Params); i++ {
-		var typeBits byte
-		if strings.HasPrefix(params[i], "r") {
-			typeBits = 0x01 // register
-		} else if strings.HasPrefix(params[i], "%") {
-			typeBits = 0x02 // direct
-		} else {
-			typeBits = 0x03 // indirect
-		}
-		pcode |= typeBits << shift
-		shift -= 2
-	}
-
-	return pcode
-}
-
-func parseParameter(param string, expectedType ParamType, hasIdx bool, line int, labelPositions map[string]int, currentPos int) (int, error) {
-	param = strings.TrimSpace(param)
-
-	// Register
-	if strings.HasPrefix(param, "r") || strings.HasPrefix(param, "R") {
-		regNum, err := strconv.Atoi(strings.TrimPrefix(param, "r"))
-		if err != nil {
-			regNum, _ = strconv.Atoi(strings.TrimPrefix(param, "R"))
-		}
-		if regNum < 1 || regNum > REG_NUMBER {
-			return 0, &ParseError{Line: line, Msg: fmt.Sprintf("invalid register: %s", param)}
-		}
-		return regNum, nil
-	}
-
-	// Direct with label (e.g., %:label)
-	if strings.HasPrefix(param, "%:") {
-		label := strings.TrimPrefix(param, "%:")
-		labelPos, ok := labelPositions[label]
-		if !ok {
-			return 0, &ParseError{Line: line, Msg: fmt.Sprintf("unknown label: %s", label)}
-		}
-		val := labelPos - currentPos
-		if hasIdx {
-			val = val % IDX_MOD
-		}
-		return val, nil
-	}
-
-	// Direct with % prefix
-	if strings.HasPrefix(param, "%") {
-		val, err := parseNumber(strings.TrimPrefix(param, "%"), line)
-		if err != nil {
-			return 0, err
-		}
-		if hasIdx {
-			val = val % IDX_MOD
-		}
-		return val, nil
-	}
-
-	// Indirect with label (e.g., :label)
-	if strings.HasPrefix(param, ":") {
-		label := strings.TrimPrefix(param, ":")
-		labelPos, ok := labelPositions[label]
-		if !ok {
-			return 0, &ParseError{Line: line, Msg: fmt.Sprintf("unknown label: %s", label)}
-		}
-		val := labelPos - currentPos
-		if hasIdx {
-			val = val % IDX_MOD
-		}
-		return val, nil
-	}
-
-	// Indirect - could be a number
-	if strings.ContainsAny(param, "-+") || isNumeric(param) {
-		val, err := parseNumber(param, line)
-		if err != nil {
-			return 0, err
-		}
-		if hasIdx {
-			val = val % IDX_MOD
-		}
-		return val, nil
-	}
-
-	// Must be a label - this should be resolved in second pass
-	return 0, &ParseError{Line: line, Msg: fmt.Sprintf("invalid parameter: %s", param)}
-}
-
-func isNumeric(s string) bool {
-	for _, c := range s {
-		if !unicode.IsDigit(c) {
+func validLabel(label string) bool {
+	for _, r := range label {
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
 			return false
 		}
 	}
 	return true
 }
 
-func parseNumber(s string, line int) (int, error) {
-	s = strings.TrimSpace(s)
-
-	// Handle negative hex
-	if strings.HasPrefix(s, "-0x") || strings.HasPrefix(s, "-0X") {
-		v, err := strconv.ParseInt(s, 0, 32)
-		if err != nil {
-			return 0, &ParseError{Line: line, Msg: fmt.Sprintf("invalid number: %s", s)}
-		}
-		return int(v), nil
+func parseInstruction(line string, lineNo, offset int) (ParsedInstruction, error) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return ParsedInstruction{}, &ParseError{Line: lineNo, Msg: "empty instruction"}
 	}
 
-	// Handle positive hex
-	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		v, err := strconv.ParseInt(s, 0, 32)
-		if err != nil {
-			return 0, &ParseError{Line: line, Msg: fmt.Sprintf("invalid number: %s", s)}
-		}
-		return int(v), nil
+	name := fields[0]
+	instDef, ok := Instructions[name]
+	if !ok {
+		return ParsedInstruction{}, &ParseError{Line: lineNo, Msg: "unknown instruction: " + name}
 	}
 
-	// Regular number
-	v, err := strconv.ParseInt(s, 10, 32)
+	paramText := strings.TrimSpace(line[len(name):])
+	parts := splitParams(paramText)
+	if len(parts) != instDef.NbParams {
+		return ParsedInstruction{}, &ParseError{Line: lineNo, Msg: fmt.Sprintf("%s expects %d parameter(s), got %d", name, instDef.NbParams, len(parts))}
+	}
+
+	args := make([]argument, 0, len(parts))
+	for i, part := range parts {
+		arg, err := parseArgument(part, lineNo)
+		if err != nil {
+			return ParsedInstruction{}, err
+		}
+		if instDef.Params[i]&maskFor(arg.Type) == 0 {
+			return ParsedInstruction{}, &ParseError{Line: lineNo, Msg: fmt.Sprintf("invalid parameter %d for %s: %s", i+1, name, part)}
+		}
+		args = append(args, arg)
+	}
+
+	return ParsedInstruction{Name: name, Args: args, Line: lineNo, Offset: offset}, nil
+}
+
+func splitParams(paramText string) []string {
+	if strings.TrimSpace(paramText) == "" {
+		return nil
+	}
+	raw := strings.Split(paramText, ",")
+	params := make([]string, 0, len(raw))
+	for _, part := range raw {
+		params = append(params, strings.TrimSpace(part))
+	}
+	return params
+}
+
+func parseArgument(raw string, lineNo int) (argument, error) {
+	if raw == "" {
+		return argument{}, &ParseError{Line: lineNo, Msg: "empty parameter"}
+	}
+
+	if strings.HasPrefix(raw, "r") || strings.HasPrefix(raw, "R") {
+		n, err := strconv.Atoi(raw[1:])
+		if err != nil || n < 1 || n > REG_NUMBER {
+			return argument{}, &ParseError{Line: lineNo, Msg: "invalid register: " + raw}
+		}
+		return argument{Raw: raw, Type: PARAM_REG, Value: int32(n)}, nil
+	}
+
+	if strings.HasPrefix(raw, "%:") {
+		label := raw[2:]
+		if !validLabel(label) {
+			return argument{}, &ParseError{Line: lineNo, Msg: "invalid label reference: " + raw}
+		}
+		return argument{Raw: raw, Type: PARAM_DIR, Label: label}, nil
+	}
+
+	if strings.HasPrefix(raw, "%") {
+		n, err := parseNumber(raw[1:], lineNo)
+		if err != nil {
+			return argument{}, err
+		}
+		return argument{Raw: raw, Type: PARAM_DIR, Value: n}, nil
+	}
+
+	if strings.HasPrefix(raw, ":") {
+		label := raw[1:]
+		if !validLabel(label) {
+			return argument{}, &ParseError{Line: lineNo, Msg: "invalid label reference: " + raw}
+		}
+		return argument{Raw: raw, Type: PARAM_IND, Label: label}, nil
+	}
+
+	n, err := parseNumber(raw, lineNo)
 	if err != nil {
-		return 0, &ParseError{Line: line, Msg: fmt.Sprintf("invalid number: %s", s)}
+		return argument{}, err
 	}
-	return int(v), nil
+	return argument{Raw: raw, Type: PARAM_IND, Value: n}, nil
+}
+
+func parseNumber(s string, lineNo int) (int32, error) {
+	if strings.TrimSpace(s) == "" {
+		return 0, &ParseError{Line: lineNo, Msg: "empty number"}
+	}
+	n, err := strconv.ParseInt(s, 0, 32)
+	if err != nil {
+		return 0, &ParseError{Line: lineNo, Msg: "invalid number: " + s}
+	}
+	return int32(n), nil
+}
+
+func instructionSize(inst ParsedInstruction) int {
+	def := Instructions[inst.Name]
+	size := OPCODE_SIZE
+	if def.HasPcode {
+		size += PCODE_SIZE
+	}
+	for _, arg := range inst.Args {
+		size += argumentSize(arg.Type, def.HasIdx)
+	}
+	return size
+}
+
+func argumentSize(t ParamType, hasIdx bool) int {
+	switch t {
+	case PARAM_REG:
+		return 1
+	case PARAM_DIR:
+		if hasIdx {
+			return IND_SIZE
+		}
+		return DIR_SIZE
+	default:
+		return IND_SIZE
+	}
+}
+
+func encodeProgram(instructions []ParsedInstruction, labels map[string]int) ([]byte, error) {
+	var code []byte
+	for _, inst := range instructions {
+		bin, err := encodeInstruction(inst, labels)
+		if err != nil {
+			return nil, err
+		}
+		code = append(code, bin...)
+	}
+	return code, nil
+}
+
+func encodeInstruction(inst ParsedInstruction, labels map[string]int) ([]byte, error) {
+	def := Instructions[inst.Name]
+	out := []byte{byte(def.OpCode)}
+	if def.HasPcode {
+		out = append(out, pcode(inst.Args))
+	}
+
+	for _, arg := range inst.Args {
+		value := arg.Value
+		if arg.Label != "" {
+			labelOffset, ok := labels[arg.Label]
+			if !ok {
+				return nil, &ParseError{Line: inst.Line, Msg: "unknown label: " + arg.Label}
+			}
+			value = int32(labelOffset - inst.Offset)
+		}
+
+		switch arg.Type {
+		case PARAM_REG:
+			out = append(out, byte(value))
+		case PARAM_DIR:
+			if def.HasIdx {
+				out = appendI16(out, int16(value))
+			} else {
+				out = appendI32(out, value)
+			}
+		case PARAM_IND:
+			out = appendI16(out, int16(value))
+		}
+	}
+
+	return out, nil
+}
+
+func pcode(args []argument) byte {
+	var code byte
+	for i, arg := range args {
+		code |= byte(arg.Type) << (6 - i*2)
+	}
+	return code
+}
+
+func appendI16(out []byte, v int16) []byte {
+	u := uint16(v)
+	return append(out, byte(u>>8), byte(u))
+}
+
+func appendI32(out []byte, v int32) []byte {
+	u := uint32(v)
+	return append(out, byte(u>>24), byte(u>>16), byte(u>>8), byte(u))
+}
+
+func writeBinary(path, name, desc string, code []byte) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("cannot create output file: %w", err)
+	}
+	defer f.Close()
+
+	if err := binary.Write(f, binary.BigEndian, MAGIC); err != nil {
+		return err
+	}
+	if err := writePadded(f, []byte(name), PROG_NAME_LENGTH); err != nil {
+		return err
+	}
+	if err := binary.Write(f, binary.BigEndian, uint32(len(code))); err != nil {
+		return err
+	}
+	if err := writePadded(f, []byte(desc), COMMENT_LENGTH); err != nil {
+		return err
+	}
+	_, err = f.Write(code)
+	return err
+}
+
+func writePadded(w io.Writer, data []byte, size int) error {
+	if len(data) > size {
+		data = data[:size]
+	}
+	if _, err := w.Write(data); err != nil {
+		return err
+	}
+	if len(data) < size {
+		_, err := w.Write(make([]byte, size-len(data)))
+		return err
+	}
+	return nil
 }

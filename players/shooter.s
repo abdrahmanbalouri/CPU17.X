@@ -1,15 +1,9 @@
 .name "shooter"
-.description "A warrior that shoots far"
+.description "turns ameba live for us"
 
-fork %:go
-ld %0, r2
-st r2, 100
-st r2, 200
-st r2, 300
+        sti r1, %:live, %1
+        lfork %2041
+        and r1, %0, r1
 
-go:    ld %0, r3
-       zjmp %:run
-
-run:   live %1
-       st r1, -200
-       zjmp %:run
+live:   live %0
+        zjmp %:live
